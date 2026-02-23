@@ -136,6 +136,164 @@ class BlackScholesPricer:
 
         return Greeks(delta=delta, gamma=gamma, vega=vega, theta=theta, rho=rho)
 
+# ============================================================
+# 2.5) Binomial Tree (CRR) pricer + Greeks
+# ============================================================
+
+@dataclass(frozen=True)
+class BinomialSettings:
+    steps: int = 800
+    bump_rel: float = 1e-4  # for vega/rho bumps
+
+
+class BinomialTreePricer:
+    """
+    CRR binomial tree. Supports European + American (early exercise).
+    - Price: backward induction
+    - Greeks:
+        * Delta/Gamma: from first/second layer prices
+        * Theta: maturity bump by one dt (per year)
+        * Vega/Rho: bump-and-reprice
+    """
+
+    def _params(self, opt: VanillaOption, mkt: MarketData, settings: BinomialSettings):
+        S0, K, T = mkt.spot, opt.strike, opt.maturity
+        r, q, sigma = mkt.rate, mkt.dividend, mkt.vol
+        N = int(settings.steps)
+
+        if T <= 0:
+            raise ValueError("Maturity must be > 0 for binomial parameters.")
+        if N < 2:
+            raise ValueError("Binomial steps must be >= 2 for stable greeks.")
+        if S0 <= 0 or K <= 0:
+            raise ValueError("Spot and strike must be > 0.")
+
+        dt = T / N
+
+        if sigma <= 0:
+            # deterministic limit handled in price()
+            u = d = 1.0
+            p = 0.5
+        else:
+            u = math.exp(sigma * math.sqrt(dt))
+            d = 1.0 / u
+            p = (math.exp((r - q) * dt) - d) / (u - d)
+            # clamp to avoid UI crashes under extreme params
+            p = min(1.0, max(0.0, p))
+
+        disc = math.exp(-r * dt)
+        return N, dt, u, d, p, disc
+
+    def price(self, opt: VanillaOption, mkt: MarketData, settings: BinomialSettings) -> float:
+        if opt.maturity <= 0:
+            return opt.payoff(mkt.spot)
+
+        S0, K, T = mkt.spot, opt.strike, opt.maturity
+        r, q, sigma = mkt.rate, mkt.dividend, mkt.vol
+
+        if sigma <= 0:
+            # deterministic forward limit
+            fwd = S0 * math.exp((r - q) * T)
+            discT = math.exp(-r * T)
+            if opt.kind == OptionKind.CALL:
+                return discT * max(fwd - K, 0.0)
+            else:
+                return discT * max(K - fwd, 0.0)
+
+        N, dt, u, d, p, disc = self._params(opt, mkt, settings)
+
+        # terminal stock prices S_T(j) = S0 * u^j * d^(N-j)
+        j = np.arange(N + 1)
+        S_T = S0 * (u ** j) * (d ** (N - j))
+
+        if opt.kind == OptionKind.CALL:
+            V = np.maximum(S_T - K, 0.0)
+        else:
+            V = np.maximum(K - S_T, 0.0)
+
+        # backward induction
+        if opt.style == ExerciseStyle.EUROPEAN:
+            for i in range(N - 1, -1, -1):
+                V = disc * (p * V[1:] + (1.0 - p) * V[:-1])
+            return float(V[0])
+
+        # American: early exercise each node
+        for i in range(N - 1, -1, -1):
+            V = disc * (p * V[1:] + (1.0 - p) * V[:-1])
+
+            j = np.arange(i + 1)
+            S_i = S0 * (u ** j) * (d ** (i - j))
+            payoff = np.array([opt.payoff(float(s)) for s in S_i], dtype=float)
+
+            V = np.maximum(V, payoff)
+
+        return float(V[0])
+
+    def greeks(self, opt: VanillaOption, mkt: MarketData, settings: BinomialSettings) -> Greeks:
+        N = int(settings.steps)
+        if opt.maturity <= 0 or N < 2:
+            return Greeks(0.0, 0.0, 0.0, 0.0, 0.0)
+
+        S0, K, T = mkt.spot, opt.strike, opt.maturity
+        r, q, sigma = mkt.rate, mkt.dividend, mkt.vol
+        if S0 <= 0 or K <= 0 or sigma <= 0:
+            return Greeks(0.0, 0.0, 0.0, 0.0, 0.0)
+
+        N, dt, u, d, p, disc = self._params(opt, mkt, settings)
+
+        # base
+        V0 = self.price(opt, mkt, settings)
+
+        # ---- Delta from level 1 ----
+        Su, Sd = S0 * u, S0 * d
+        Vu = self.price(opt, replace(mkt, spot=Su), settings)
+        Vd = self.price(opt, replace(mkt, spot=Sd), settings)
+        delta = (Vu - Vd) / (Su - Sd)
+
+        # ---- Gamma from level 2 ----
+        Suu, Sud, Sdd = S0 * u * u, S0 * u * d, S0 * d * d
+        Vuu = self.price(opt, replace(mkt, spot=Suu), settings)
+        Vud = self.price(opt, replace(mkt, spot=Sud), settings)
+        Vdd = self.price(opt, replace(mkt, spot=Sdd), settings)
+
+        # second derivative approx
+        gamma = (
+            (Vuu - Vud) / (Suu - Sud) - (Vud - Vdd) / (Sud - Sdd)
+        ) / ((Suu - Sdd) / 2.0)
+
+        # ---- Theta: move forward in calendar time by dt => maturity decreases ----
+        T2 = max(T - dt, 1e-12)
+        V_shorter = self.price(replace(opt, maturity=T2), mkt, settings)
+        theta = (V_shorter - V0) / dt  # per year
+
+        # ---- Vega/Rho bumps ----
+        bump = settings.bump_rel
+
+        dsig = max(1e-6, bump * max(mkt.vol, 1.0))
+        vega = (
+            self.price(opt, replace(mkt, vol=mkt.vol + dsig), settings)
+            - self.price(opt, replace(mkt, vol=max(mkt.vol - dsig, 1e-12)), settings)
+        ) / (2.0 * dsig)
+
+        dr = max(1e-6, bump)
+        rho = (
+            self.price(opt, replace(mkt, rate=mkt.rate + dr), settings)
+            - self.price(opt, replace(mkt, rate=mkt.rate - dr), settings)
+        ) / (2.0 * dr)
+
+        return Greeks(float(delta), float(gamma), float(vega), float(theta), float(rho))
+
+
+def _price_greeks_curve_binom(opt: VanillaOption, base_mkt: MarketData, binom_settings: BinomialSettings, S_grid: np.ndarray) -> pd.DataFrame:
+    bt = BinomialTreePricer()
+    out = []
+    for s in S_grid:
+        m = replace(base_mkt, spot=float(s))
+        p = bt.price(opt, m, binom_settings)
+        g = bt.greeks(opt, m, binom_settings)
+        out.append([float(s), p, g.delta, g.gamma, g.vega, g.theta, g.rho])
+    return pd.DataFrame(out, columns=["Spot", "Price", "Delta", "Gamma", "Vega", "Theta", "Rho"])
+
 
 # ============================================================
 # 3) Finite Difference (Theta-scheme) + PSOR for American
@@ -600,11 +758,17 @@ with st.sidebar:
 
     st.divider()
 
-    if style == ExerciseStyle.EUROPEAN:
-        model = st.selectbox("Model for Pricing", ["Black–Scholes (Analytic)", "Finite Difference (Theta Scheme)"])
+       if style == ExerciseStyle.EUROPEAN:
+        model = st.selectbox("Model for Pricing", [
+            "Black–Scholes (Analytic)",
+            "Finite Difference (Theta Scheme)",
+            "Binomial Tree (CRR)"
+        ])
     else:
-        model = "Finite Difference (Theta Scheme)"
-        st.info("American options use FDM + early exercise (PSOR).")
+        model = st.selectbox("Model for Pricing", [
+            "Finite Difference (Theta Scheme)",
+            "Binomial Tree (CRR)"
+        ])
 
     st.divider()
 
@@ -625,6 +789,10 @@ with st.sidebar:
         bump_rel = st.number_input("Bump size (relative) for Vega/Rho", value=1e-4, format="%.1e")
 
     st.divider()
+
+    with st.expander("Binomial Settings", expanded=False):
+        binom_steps = st.slider("Binomial steps", 50, 5000, 800, 50)
+        binom_bump_rel = st.number_input("Binomial bump size (relative) for Vega/Rho", value=1e-4, format="%.1e")
 
     with st.expander("Plot Ranges"):
         s_min_mult = st.slider("Spot range min (mult * S)", 0.1, 1.0, 0.5, 0.05)
@@ -654,6 +822,10 @@ settings = FDMSettings(
     bump_rel=float(bump_rel),
 )
 
+binom_settings = BinomialSettings(
+    steps=int(binom_steps),
+    bump_rel=float(binom_bump_rel),
+)
 S_grid_curve = np.linspace(s_min_mult*mkt.spot, s_max_mult*mkt.spot, int(n_pts))
 
 
@@ -733,16 +905,16 @@ with tabs[0]:
         )
 
         if style == ExerciseStyle.EUROPEAN and model == "Black–Scholes (Analytic)":
-            curve_df = _price_greeks_curve_bs(
-                opt, mkt, S_grid_curve
-            )
+            curve_df = _price_greeks_curve_bs(opt, mkt, S_grid_curve)
+        elif model == "Binomial Tree (CRR)":
+            curve_df = _price_greeks_curve_binom(opt, mkt, binom_settings, S_grid_curve)
         else:
             curve_df = _price_greeks_curve_fdm(
                 opt, mkt, settings,
                 S_grid_curve,
                 compute_vega_rho_american
             )
-
+            
         fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=curve_df["Spot"],
@@ -795,6 +967,9 @@ with tabs[1]:
     if style == ExerciseStyle.EUROPEAN and model == "Black–Scholes (Analytic)":
         df = _price_greeks_curve_bs(opt, mkt, S_grid_curve)
         method_note = "Computed using analytic Black–Scholes formulas at each spot."
+    elif model == "Binomial Tree (CRR)":
+        df = _price_greeks_curve_binom(opt, mkt, binom_settings, S_grid_curve)
+        method_note = "Computed using CRR binomial tree at each spot (includes early exercise if American)."
     else:
         df = _price_greeks_curve_fdm(opt, mkt, settings, S_grid_curve, compute_vega_rho_american)
         method_note = "Computed from ONE PDE solve (plus bumps for Vega/Rho if enabled), then interpolated across spot."
@@ -1139,3 +1314,4 @@ with tabs[4]:
     \Theta \approx
     \frac{V(\tau=T-\Delta\tau)-V(\tau=T)}{\Delta\tau}
     """)
+
