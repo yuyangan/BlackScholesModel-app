@@ -758,11 +758,11 @@ with st.sidebar:
 
     st.divider()
     if style == ExerciseStyle.EUROPEAN:
-    model = st.selectbox("Model for Pricing", [
-        "Black–Scholes (Analytic)",
-        "Finite Difference (Theta Scheme)",
-        "Binomial Tree (CRR)"
-        ])
+        model = st.selectbox("Model for Pricing", [
+            "Black–Scholes (Analytic)",
+            "Finite Difference (Theta Scheme)",
+            "Binomial Tree (CRR)"
+            ])
     else:
         model = st.selectbox("Model for Pricing", [
             "Finite Difference (Theta Scheme)",
@@ -1329,6 +1329,7 @@ with tabs[4]:
     \Theta \approx
     \frac{V(\tau=T-\Delta\tau)-V(\tau=T)}{\Delta\tau}
     """)
+
 
 
 
