@@ -394,7 +394,7 @@ def _boundary_values(opt: VanillaOption, mkt: MarketData, tau: float, smax: floa
     return V0, Vmax
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def fdm_solve(opt: VanillaOption, mkt: MarketData, settings: FDMSettings, store_matrix: bool) -> FDMResult:
     if opt.maturity <= 0:
         S = np.array([0.0, mkt.spot, 2.0*mkt.spot], dtype=float)
@@ -528,7 +528,7 @@ def _grid_derivatives(S: np.ndarray, V: np.ndarray, V_prev: np.ndarray, dt: floa
     return {"delta": delta, "gamma": gamma, "theta": theta}
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def fdm_greeks(opt: VanillaOption, mkt: MarketData, settings: FDMSettings, compute_vega_rho: bool) -> Tuple[float, Greeks, Dict[str, np.ndarray], FDMResult]:
     """Return price, point-greeks at S0, grid greeks arrays, and the FDMResult (for plots)."""
     res = fdm_solve(opt, mkt, settings, store_matrix=True)
@@ -1329,6 +1329,7 @@ with tabs[4]:
     \Theta \approx
     \frac{V(\tau=T-\Delta\tau)-V(\tau=T)}{\Delta\tau}
     """)
+
 
 
 
