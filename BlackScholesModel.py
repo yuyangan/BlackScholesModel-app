@@ -757,48 +757,19 @@ with st.sidebar:
     vol = st.number_input("Volatility sigma", min_value=0.000001, value=0.20, step=0.01, format="%.6f")
 
     st.divider()
-
-    fdm_res = None
-    grids = None
-    extra = {}
-    model_name = ""
-    
-    if style == ExerciseStyle.EUROPEAN and model == "Black–Scholes (Analytic)":
-        bs = BlackScholesPricer()
-        price0 = bs.price(opt, mkt)
-        g0 = bs.greeks(opt, mkt)
-        model_name = "Black–Scholes (Analytic)"
-        extra = {"Model Notes": "Analytic Black–Scholes"}
-    
-    elif model == "Binomial Tree (CRR)":
-        bt = BinomialTreePricer()
-        price0 = bt.price(opt, mkt, binom_settings)
-        g0 = bt.greeks(opt, mkt, binom_settings)
-        model_name = "Binomial Tree (CRR)"
-        extra = {
-            "steps": int(binom_settings.steps),
-            "bump_rel": float(binom_settings.bump_rel),
-            "Model Notes": "CRR tree (early exercise if American)"
-        }
-    
+    if style == ExerciseStyle.EUROPEAN:
+    model = st.selectbox("Model for Pricing", [
+        "Black–Scholes (Analytic)",
+        "Finite Difference (Theta Scheme)",
+        "Binomial Tree (CRR)"
+        ])
     else:
-        # Finite Difference (Theta Scheme)
-        price0, g0, grids, fdm_res = fdm_greeks(
-            opt, mkt, settings,
-            compute_vega_rho=compute_vega_rho_american
-        )
-        model_name = "Finite Difference (Theta Scheme)"
-        extra = {
-            "Smax": float(fdm_res.smax),
-            "dS": float(fdm_res.dS),
-            "dt": float(fdm_res.dt),
-            "theta": float(settings.theta),
-            "rannacher_steps": int(settings.rannacher_steps),
-            "PSOR": int(settings.use_psor),
-        }
-
+        model = st.selectbox("Model for Pricing", [
+            "Finite Difference (Theta Scheme)",
+            "Binomial Tree (CRR)"
+        ])
     st.divider()
-
+    
     with st.expander("FDM Settings (American / PDE)", expanded=(style == ExerciseStyle.AMERICAN)):
         n_space = st.slider("n_space (spot steps)", 50, 800, 250, 10)
         n_time = st.slider("n_time (time steps)", 50, 800, 250, 10)
@@ -868,27 +839,44 @@ with tabs[0]:
     # -------------------------------
     # Pricing + Greeks (logic unchanged)
     # -------------------------------
+    fdm_res = None
+    grids = None
+    extra = {}
+    model_name = ""
+    
     if style == ExerciseStyle.EUROPEAN and model == "Black–Scholes (Analytic)":
         bs = BlackScholesPricer()
         price0 = bs.price(opt, mkt)
         g0 = bs.greeks(opt, mkt)
-        extra = {"Model Notes": "Analytic Black–Scholes"}
         model_name = "Black–Scholes (Analytic)"
-        fdm_res = None
+        extra = {"Model Notes": "Analytic Black–Scholes"}
+    
+    elif model == "Binomial Tree (CRR)":
+        bt = BinomialTreePricer()
+        price0 = bt.price(opt, mkt, binom_settings)
+        g0 = bt.greeks(opt, mkt, binom_settings)
+        model_name = "Binomial Tree (CRR)"
+        extra = {
+            "steps": int(binom_settings.steps),
+            "bump_rel": float(binom_settings.bump_rel),
+            "Model Notes": "CRR tree (early exercise if American)"
+        }
+    
     else:
         price0, g0, grids, fdm_res = fdm_greeks(
             opt, mkt, settings,
             compute_vega_rho=compute_vega_rho_american
         )
+    
+        model_name = "Finite Difference (Theta Scheme)"
         extra = {
             "Smax": float(fdm_res.smax),
             "dS": float(fdm_res.dS),
             "dt": float(fdm_res.dt),
-            "theta": settings.theta,
-            "rannacher_steps": settings.rannacher_steps,
+            "theta": float(settings.theta),
+            "rannacher_steps": int(settings.rannacher_steps),
             "PSOR": int(settings.use_psor),
         }
-        model_name = "Finite Difference (Theta Scheme)"
 
     # ===============================
     # TOP ROW — FULL WIDTH GREEKS
@@ -1341,6 +1329,7 @@ with tabs[4]:
     \Theta \approx
     \frac{V(\tau=T-\Delta\tau)-V(\tau=T)}{\Delta\tau}
     """)
+
 
 
 
