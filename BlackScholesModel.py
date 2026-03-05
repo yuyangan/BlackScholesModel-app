@@ -293,6 +293,104 @@ def _price_greeks_curve_binom(opt: VanillaOption, base_mkt: MarketData, binom_se
         g = bt.greeks(opt, m, binom_settings)
         out.append([float(s), p, g.delta, g.gamma, g.vega, g.theta, g.rho])
     return pd.DataFrame(out, columns=["Spot", "Price", "Delta", "Gamma", "Vega", "Theta", "Rho"])
+# ============================================================
+# 2.75) Monte Carlo (European) pricer + Greeks
+# ============================================================
+
+@dataclass(frozen=True)
+class MonteCarloSettings:
+    n_paths: int = 200_000
+    seed: int = 123
+    antithetic: bool = True
+    bump_rel: float = 1e-4   # for finite-diff greeks
+
+
+class MonteCarloPricer:
+    """
+    European Monte Carlo under GBM:
+      dS = (r-q)S dt + sigma S dW
+    For European vanilla, only S_T is needed (no time discretization).
+    Price = exp(-rT) * mean(payoff(S_T))
+
+    Greeks: bump-and-reprice (simple & consistent with your codebase)
+    """
+
+    def _simulate_ST(self, opt: VanillaOption, mkt: MarketData, settings: MonteCarloSettings) -> np.ndarray:
+        S0, T = mkt.spot, opt.maturity
+        r, q, sigma = mkt.rate, mkt.dividend, mkt.vol
+
+        if T <= 0:
+            return np.array([S0], dtype=float)
+
+        n = int(settings.n_paths)
+        rng = np.random.default_rng(int(settings.seed))
+
+        drift = (r - q - 0.5 * sigma * sigma) * T
+        volT = sigma * math.sqrt(T)
+
+        if settings.antithetic:
+            half = n // 2
+            z = rng.standard_normal(half)
+            z = np.concatenate([z, -z])
+            if len(z) < n:
+                z = np.concatenate([z, rng.standard_normal(1)])
+        else:
+            z = rng.standard_normal(n)
+
+        ST = S0 * np.exp(drift + volT * z)
+        return ST.astype(float)
+
+    def price(self, opt: VanillaOption, mkt: MarketData, settings: MonteCarloSettings) -> float:
+        if opt.maturity <= 0:
+            return opt.payoff(mkt.spot)
+        if opt.style != ExerciseStyle.EUROPEAN:
+            raise ValueError("Basic Monte Carlo pricer here is for EUROPEAN options (use LSM for American).")
+
+        ST = self._simulate_ST(opt, mkt, settings)
+        payoff = np.maximum(ST - opt.strike, 0.0) if opt.kind == OptionKind.CALL else np.maximum(opt.strike - ST, 0.0)
+        disc = math.exp(-mkt.rate * opt.maturity)
+        return float(disc * payoff.mean())
+
+    def greeks(self, opt: VanillaOption, mkt: MarketData, settings: MonteCarloSettings) -> Greeks:
+        # simplest finite-difference greeks with common random numbers (CRN)
+        if opt.style != ExerciseStyle.EUROPEAN:
+            raise ValueError("MC Greeks here are for EUROPEAN (use LSM + FD bumps for American if desired).")
+
+        bump = float(settings.bump_rel)
+
+        # To reduce noise: keep SAME seed for bumps (CRN)
+        base = self.price(opt, mkt, settings)
+
+        # ---- Delta & Gamma (bump spot) ----
+        dS = max(1e-6, bump * max(mkt.spot, 1.0))
+        up = self.price(opt, replace(mkt, spot=mkt.spot + dS), settings)
+        dn = self.price(opt, replace(mkt, spot=max(mkt.spot - dS, 1e-12)), settings)
+        delta = (up - dn) / (2.0 * dS)
+
+        # gamma: second derivative
+        gamma = (up - 2.0 * base + dn) / (dS * dS)
+
+        # ---- Vega (bump sigma) ----
+        dV = max(1e-6, bump * max(mkt.vol, 1.0))
+        upv = self.price(opt, replace(mkt, vol=mkt.vol + dV), settings)
+        dnv = self.price(opt, replace(mkt, vol=max(mkt.vol - dV, 1e-12)), settings)
+        vega = (upv - dnv) / (2.0 * dV)
+
+        # ---- Rho (bump r) ----
+        dr = max(1e-6, bump)
+        upr = self.price(opt, replace(mkt, rate=mkt.rate + dr), settings)
+        dnr = self.price(opt, replace(mkt, rate=mkt.rate - dr), settings)
+        rho = (upr - dnr) / (2.0 * dr)
+
+        # ---- Theta (bump maturity down a bit) ----
+        # theta = dV/dt, but your convention prints "per year".
+        # With T as time-to-maturity: decreasing T by dT approximates dV/dT.
+        dT = max(1e-6, bump * max(opt.maturity, 1.0))
+        T2 = max(opt.maturity - dT, 1e-12)
+        shorter = self.price(replace(opt, maturity=T2), mkt, settings)
+        theta = (shorter - base) / dT  # per year (approx)
+
+        return Greeks(float(delta), float(gamma), float(vega), float(theta), float(rho))
 
 
 # ============================================================
@@ -691,6 +789,28 @@ def _price_greeks_curve_bs(opt: VanillaOption, base_mkt: MarketData, S_grid: np.
         g = bs.greeks(opt, m)
         out.append([s, p, g.delta, g.gamma, g.vega, g.theta, g.rho])
     return pd.DataFrame(out, columns=["Spot", "Price", "Delta", "Gamma", "Vega", "Theta", "Rho"])
+    
+def _price_greeks_curve_mc(opt: VanillaOption, base_mkt: MarketData, mc_settings: MonteCarloSettings, S_grid: np.ndarray) -> pd.DataFrame:
+    mc = MonteCarloPricer()
+    out = []
+
+    for s in S_grid:
+        m = replace(base_mkt, spot=float(s))
+
+        p = mc.price(opt, m, mc_settings)
+        g = mc.greeks(opt, m, mc_settings)
+
+        out.append([
+            float(s),
+            p,
+            g.delta,
+            g.gamma,
+            g.vega,
+            g.theta,
+            g.rho
+        ])
+
+    return pd.DataFrame(out, columns=["Spot", "Price", "Delta", "Gamma", "Vega", "Theta", "Rho"])
 
 
 def _price_greeks_curve_fdm(opt: VanillaOption, mkt: MarketData, settings: FDMSettings, S_grid: np.ndarray, compute_vega_rho: bool) -> pd.DataFrame:
@@ -761,8 +881,9 @@ with st.sidebar:
         model = st.selectbox("Model for Pricing", [
             "Black–Scholes (Analytic)",
             "Finite Difference (Theta Scheme)",
-            "Binomial Tree (CRR)"
-            ])
+            "Binomial Tree (CRR)",
+            "Monte Carlo (GBM)"
+        ])
     else:
         model = st.selectbox("Model for Pricing", [
             "Finite Difference (Theta Scheme)",
@@ -791,6 +912,11 @@ with st.sidebar:
     with st.expander("Binomial Settings", expanded=False):
         binom_steps = st.slider("Binomial steps", 50, 5000, 800, 50)
         binom_bump_rel = st.number_input("Binomial bump size (relative) for Vega/Rho", value=1e-4, format="%.1e")
+    with st.expander("Monte Carlo Settings", expanded=False):
+        mc_paths = st.slider("MC paths", 10_000, 1_000_000, 200_000, 10_000)
+        mc_seed = st.number_input("MC seed", value=123, step=1)
+        mc_antithetic = st.checkbox("Antithetic variates", value=True)
+        mc_bump_rel = st.number_input("MC bump_rel (for Greeks)", value=1e-4, format="%.1e")
 
     with st.expander("Plot Ranges"):
         s_min_mult = st.slider("Spot range min (mult * S)", 0.1, 1.0, 0.5, 0.05)
@@ -826,6 +952,12 @@ binom_settings = BinomialSettings(
 )
 S_grid_curve = np.linspace(s_min_mult*mkt.spot, s_max_mult*mkt.spot, int(n_pts))
 
+mc_settings = MonteCarloSettings(
+    n_paths=int(mc_paths),
+    seed=int(mc_seed),
+    antithetic=bool(mc_antithetic),
+    bump_rel=float(mc_bump_rel),
+)
 
 tabs = st.tabs(["Summary", "Greeks Curves", "Surfaces & Heatmaps", "Implied Volatility", "Model Details (Formulas)"])
 
@@ -861,7 +993,33 @@ with tabs[0]:
             "bump_rel": float(binom_settings.bump_rel),
             "Model Notes": "CRR tree (early exercise if American)"
         }
+    elif style == ExerciseStyle.EUROPEAN and model == "Monte Carlo (GBM)":
+        mc = MonteCarloPricer()
+        price0 = mc.price(opt, mkt, mc_settings)
+        g0 = mc.greeks(opt, mkt, mc_settings)
+        model_name = "Monte Carlo (GBM)"
+        extra = {
+            "n_paths": int(mc_settings.n_paths),
+            "seed": int(mc_settings.seed),
+            "antithetic": int(mc_settings.antithetic),
+            "bump_rel": float(mc_settings.bump_rel),
+            "Model Notes": "European MC with GBM closed-form ST; Greeks via bump-and-reprice (CRN)."
+        }
+
+    elif style == ExerciseStyle.EUROPEAN and model == "Monte Carlo (GBM)":
+        mc = MonteCarloPricer()
+        price0 = mc.price(opt, mkt, mc_settings)
+        g0 = mc.greeks(opt, mkt, mc_settings)
     
+        model_name = "Monte Carlo (GBM)"
+        extra = {
+            "n_paths": int(mc_settings.n_paths),
+            "seed": int(mc_settings.seed),
+            "antithetic": int(mc_settings.antithetic),
+            "bump_rel": float(mc_settings.bump_rel),
+            "Model Notes": "European Monte Carlo with GBM."
+        }
+        
     else:
         price0, g0, grids, fdm_res = fdm_greeks(
             opt, mkt, settings,
@@ -923,6 +1081,8 @@ with tabs[0]:
             curve_df = _price_greeks_curve_bs(opt, mkt, S_grid_curve)
         elif model == "Binomial Tree (CRR)":
             curve_df = _price_greeks_curve_binom(opt, mkt, binom_settings, S_grid_curve)
+        elif style == ExerciseStyle.EUROPEAN and model == "Monte Carlo (GBM)":
+            curve_df = _price_greeks_curve_mc(opt, mkt, mc_settings, S_grid_curve)
         else:
             curve_df = _price_greeks_curve_fdm(
                 opt, mkt, settings,
@@ -985,6 +1145,9 @@ with tabs[1]:
     elif model == "Binomial Tree (CRR)":
         df = _price_greeks_curve_binom(opt, mkt, binom_settings, S_grid_curve)
         method_note = "Computed using CRR binomial tree at each spot (includes early exercise if American)."
+    elif style == ExerciseStyle.EUROPEAN and model == "Monte Carlo (GBM)":
+        df = _price_greeks_curve_mc(opt, mkt, mc_settings, S_grid_curve)
+        method_note = "Monte Carlo simulation under GBM at each spot."
     else:
         df = _price_greeks_curve_fdm(opt, mkt, settings, S_grid_curve, compute_vega_rho_american)
         method_note = "Computed from ONE PDE solve (plus bumps for Vega/Rho if enabled), then interpolated across spot."
@@ -1329,6 +1492,7 @@ with tabs[4]:
     \Theta \approx
     \frac{V(\tau=T-\Delta\tau)-V(\tau=T)}{\Delta\tau}
     """)
+
 
 
 
