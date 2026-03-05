@@ -758,17 +758,44 @@ with st.sidebar:
 
     st.divider()
 
-    if style == ExerciseStyle.EUROPEAN:
-        model = st.selectbox("Model for Pricing", [
-            "Black–Scholes (Analytic)",
-            "Finite Difference (Theta Scheme)",
-            "Binomial Tree (CRR)"
-        ])
+    fdm_res = None
+    grids = None
+    extra = {}
+    model_name = ""
+    
+    if style == ExerciseStyle.EUROPEAN and model == "Black–Scholes (Analytic)":
+        bs = BlackScholesPricer()
+        price0 = bs.price(opt, mkt)
+        g0 = bs.greeks(opt, mkt)
+        model_name = "Black–Scholes (Analytic)"
+        extra = {"Model Notes": "Analytic Black–Scholes"}
+    
+    elif model == "Binomial Tree (CRR)":
+        bt = BinomialTreePricer()
+        price0 = bt.price(opt, mkt, binom_settings)
+        g0 = bt.greeks(opt, mkt, binom_settings)
+        model_name = "Binomial Tree (CRR)"
+        extra = {
+            "steps": int(binom_settings.steps),
+            "bump_rel": float(binom_settings.bump_rel),
+            "Model Notes": "CRR tree (early exercise if American)"
+        }
+    
     else:
-        model = st.selectbox("Model for Pricing", [
-            "Finite Difference (Theta Scheme)",
-            "Binomial Tree (CRR)"
-        ])
+        # Finite Difference (Theta Scheme)
+        price0, g0, grids, fdm_res = fdm_greeks(
+            opt, mkt, settings,
+            compute_vega_rho=compute_vega_rho_american
+        )
+        model_name = "Finite Difference (Theta Scheme)"
+        extra = {
+            "Smax": float(fdm_res.smax),
+            "dS": float(fdm_res.dS),
+            "dt": float(fdm_res.dt),
+            "theta": float(settings.theta),
+            "rannacher_steps": int(settings.rannacher_steps),
+            "PSOR": int(settings.use_psor),
+        }
 
     st.divider()
 
@@ -1314,5 +1341,6 @@ with tabs[4]:
     \Theta \approx
     \frac{V(\tau=T-\Delta\tau)-V(\tau=T)}{\Delta\tau}
     """)
+
 
 
