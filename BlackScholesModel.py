@@ -142,9 +142,8 @@ class BlackScholesPricer:
 
 @dataclass(frozen=True)
 class BinomialSettings:
-    steps: int = 800
+    steps: int = 3
     bump_rel: float = 1e-4  # for vega/rho bumps
-
 
 class BinomialTreePricer:
     """
@@ -293,6 +292,104 @@ def _price_greeks_curve_binom(opt: VanillaOption, base_mkt: MarketData, binom_se
         g = bt.greeks(opt, m, binom_settings)
         out.append([float(s), p, g.delta, g.gamma, g.vega, g.theta, g.rho])
     return pd.DataFrame(out, columns=["Spot", "Price", "Delta", "Gamma", "Vega", "Theta", "Rho"])
+
+def _build_binomial_tree_dataframe(opt: VanillaOption, mkt: MarketData, settings: BinomialSettings) -> pd.DataFrame:
+    """
+    Build node coordinates for a fixed-step CRR binomial tree.
+    Returns a dataframe with:
+        step, up_moves, spot, x, y, label
+    """
+    bt = BinomialTreePricer()
+    N, dt, u, d, p, disc = bt._params(opt, mkt, settings)
+
+    rows = []
+    for i in range(N + 1):          # time step
+        for j in range(i + 1):      # number of up moves
+            S_ij = mkt.spot * (u ** j) * (d ** (i - j))
+
+            # x = time step
+            x = i
+
+            # y = vertical position for drawing
+            # make the tree look symmetric
+            y = 2 * j - i
+
+            rows.append({
+                "step": i,
+                "up_moves": j,
+                "spot": float(S_ij),
+                "x": float(x),
+                "y": float(y),
+                "label": f"S={S_ij:.2f}"
+            })
+
+    return pd.DataFrame(rows)
+
+def _plot_binomial_tree(opt: VanillaOption, mkt: MarketData, settings: BinomialSettings) -> go.Figure:
+    """
+    Plot a CRR binomial tree with node labels.
+    """
+    tree_df = _build_binomial_tree_dataframe(opt, mkt, settings)
+
+    fig = go.Figure()
+
+    # ---- draw edges ----
+    for _, row in tree_df.iterrows():
+        i = int(row["step"])
+        j = int(row["up_moves"])
+        x0 = row["x"]
+        y0 = row["y"]
+
+        if i < settings.steps:
+            # up child: (i+1, j+1)
+            up_y = 2 * (j + 1) - (i + 1)
+            fig.add_trace(go.Scatter(
+                x=[x0, i + 1],
+                y=[y0, up_y],
+                mode="lines",
+                line=dict(width=1),
+                hoverinfo="skip",
+                showlegend=False
+            ))
+
+            # down child: (i+1, j)
+            down_y = 2 * j - (i + 1)
+            fig.add_trace(go.Scatter(
+                x=[x0, i + 1],
+                y=[y0, down_y],
+                mode="lines",
+                line=dict(width=1),
+                hoverinfo="skip",
+                showlegend=False
+            ))
+
+    # ---- draw nodes ----
+    fig.add_trace(go.Scatter(
+        x=tree_df["x"],
+        y=tree_df["y"],
+        mode="markers+text",
+        text=tree_df["label"],
+        textposition="top center",
+        marker=dict(size=12),
+        hovertemplate=(
+            "Step: %{customdata[0]}<br>"
+            "Up moves: %{customdata[1]}<br>"
+            "Spot: %{customdata[2]:.4f}<extra></extra>"
+        ),
+        customdata=tree_df[["step", "up_moves", "spot"]].to_numpy(),
+        name="Nodes"
+    ))
+
+    fig.update_layout(
+        title=f"Binomial Tree (CRR, {settings.steps} Steps)",
+        xaxis_title="Step",
+        yaxis_title="Node Position",
+        height=500,
+        yaxis=dict(showticklabels=False),
+        showlegend=False
+    )
+
+    return fig
 # ============================================================
 # 2.75) Monte Carlo (European) pricer + Greeks
 # ============================================================
@@ -910,7 +1007,7 @@ with st.sidebar:
     st.divider()
 
     with st.expander("Binomial Settings", expanded=False):
-        binom_steps = st.slider("Binomial steps", 50, 5000, 800, 50)
+        st.write("Binomial steps are fixed at 3 for visualization.")
         binom_bump_rel = st.number_input("Binomial bump size (relative) for Vega/Rho", value=1e-4, format="%.1e")
     with st.expander("Monte Carlo Settings", expanded=False):
         mc_paths = st.slider("MC paths", 10_000, 1_000_000, 200_000, 10_000)
@@ -947,7 +1044,7 @@ settings = FDMSettings(
 )
 
 binom_settings = BinomialSettings(
-    steps=int(binom_steps),
+    steps=3,
     bump_rel=float(binom_bump_rel),
 )
 S_grid_curve = np.linspace(s_min_mult*mkt.spot, s_max_mult*mkt.spot, int(n_pts))
@@ -1111,6 +1208,11 @@ with tabs[0]:
         )
 
         st.plotly_chart(fig, use_container_width=True)
+
+        if model == "Binomial Tree (CRR)":
+            st.subheader("Binomial Tree Diagram")
+            tree_fig = _plot_binomial_tree(opt, mkt, binom_settings)
+            st.plotly_chart(tree_fig, use_container_width=True)
 
         st.subheader("Curve Table")
         st.dataframe(
